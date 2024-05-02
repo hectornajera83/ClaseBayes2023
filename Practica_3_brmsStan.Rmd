@@ -1,0 +1,322 @@
+---
+title: "Bayes Aplicado ENIGH"
+author: "Hector Najera y Curtis Huffman"
+date: "01/05/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introducción
+
+Esta nota brinda una introducción bastante elemental a los siguientes tipos de modelos:
+
+- Modelación no multinivel
+- Modelación multinivel: Ordenadas al origen
+- Modelación multinivel: Ordenadas al origen y pendientes
+
+También se aborda el cómputo de los estadísticos de validación cruzada: loo
+
+```{r}
+library(pacman)
+p_load(haven, dplyr, brms, bayesplot, tidybayes, ggplot2)
+color_scheme_set(scheme = "viridis")
+```
+
+```{r}
+D<-read_dta("pobreza_18.dta")
+```
+
+# Modelo multinivel y no multinivel
+
+## Modelo de un nivel
+
+Vamos a utilizar datos de la ENIGH 2018. Usaremos el nivel educativo, el tamaño del hogar y el de localidad como variables de ajuste. Además ajustaremos el modelo por la entidad federativa de residencia. 
+
+
+```{r}
+M<-brm(pobreza ~ 1 + factor(niv_edexpjh), 
+        prior = c(set_prior("normal(0,10)", class = "b")),
+        family="bernoulli", chains=4, cores=4, iter=2000,  threads = threading(14, grainsize = 100),backend = "cmdstanr", data=D)
+summary(M)
+```
+
+```{r}
+M1<-brm(pobreza ~ 1 + factor(niv_edexpjh) + tamhogesc + factor(tam_loc) + factor(ent), 
+        prior = c(set_prior("normal(0,10)", class = "b")),
+        family="bernoulli", chains=4, cores=4, iter=2000,  threads = threading(14, grainsize = 100),backend = "cmdstanr", data=D)
+summary(M1)
+```
+
+¿Incrementa Chiapas el riesgo de vivir en pobreza, relativo a Aguascalientes?
+
+```{r}
+get_variables(M1)
+plot_title <- ggtitle("Posterior distributions",
+                      "with medians and 95% intervals")
+mcmc_areas(M1,
+           pars = c( "b_factorent7"),
+           prob = 0.95) + plot_title
+```
+
+## Chequeos predictivos posteriores
+
+Quisieramos saber si el modelo hace buenas predicciones de las proporciones población pobre y no pobre. Para ello podemos utilizar la función `pp_check`. Dado que se trata de una variable categórica vamos a solicitar una gráfica de barras. 
+
+Como puede apreciarse, el modelo hace un muy buen trabjo en predecir las proporciones de población pobre y no pobre. 
+
+```{r}
+pp_check(M1, ndraws = 11, type = "bars")
+```
+
+## Compración de modelos: Validacion cruzada. 
+
+NOTA: El comando `loo` toma mucho tiempo. Modera tus expectativas. Abajo utilizamos una aproximación con `loo_subsample`. 
+
+*The Pareto k estimate is a diagnostic for Pareto smoothed importance sampling (PSIS), which is used to compute components of elpd_loo. In importance-sampling LOO (the full posterior distribution is used as the proposal distribution). The Pareto k diagnostic estimates how far an individual leave-one-out distribution is from the full distribution. If leaving out an observation changes the posterior too much then importance sampling is not able to give reliable estimate. If k<0.5, then the corresponding component of elpd_loo is estimated with high accuracy. If 0.5<k<0.7 the accuracy is lower, but still ok. If k>0.7, then importance sampling is not able to provide useful estimate for that component/observation. Pareto k is also useful as a measure of influence of an observation. Highly influential observations have high k values. **Very high k values often indicate model misspecification, outliers or mistakes in data processing.*** 
+
+```{r}
+M.loo<-loo(M)
+M1.loo<-loo(M1)
+M.loo
+M1.loo
+```
+
+*When using loo_compare(), the returned matrix will have one row per model and several columns of estimates. The values in the elpd_diff and se_diff columns of the returned matrix are computed by making pairwise comparisons between each model and the model with the largest ELPD (the model in the first row). For this reason the elpd_diff column will always have the value 0 in the first row (i.e., the difference between the preferred model and itself) and negative values in subsequent rows for the remaining models.*
+
+El modelo con el valor más bajo "elpd_diff" es el peor
+
+El modelo de referencia "0" es el mejor. La diferencia es trivial entre ambos. 
+
+```{r}
+loo_compare(M1.loo,M.loo)
+```
+
+### LOO eficiente basado en n=400
+
+```{r}
+fastloo<-loo_subsample(M)
+fastloo1<-loo_subsample(M1)
+loo_compare(fastloo1,fastloo)
+```
+
+Gráficas con loo
+
+```{r}
+plot(fastloo1)
+```
+
+## Multinivel
+
+```{r}
+M1.b<-brm(pobreza ~ 1 + factor(niv_edexpjh) + tamhogesc + factor(tam_loc) + (1 | ent), 
+        prior = c(set_prior("normal(0,10)", class = "b"),
+                  set_prior("normal(0,5)", class = "sd")),
+        family="bernoulli", chains=4, cores=4, iter=1500,  threads = threading(14, grainsize = 100),backend = "cmdstanr", data=D)
+summary(M1.b)
+```
+
+A continuación graficamos las distribuciones posteriores del efecto aleatorio para cada entidad. Tenemos que hacer varias manipulaciones de las MCMC para poder hacerlo. Observamos las diferencias en efecto para los diferentes estados. 
+
+```{r}
+ranef(M1.b, groups="ent", probs = 0.5)
+
+library(stringr)
+
+M1.b %>%
+  spread_draws(r_ent[ent,]) %>%
+  # add the grand mean to the group-specific deviations
+  mutate(mu = r_ent) %>%
+  ungroup() %>%
+  mutate(ent = str_replace_all(ent, "[.]", " ")) %>% 
+  
+  # plot
+  ggplot(aes(x = mu, y = reorder(ent, mu))) +
+  geom_vline(xintercept = fixef(M1.b)[1, 1], color = "#839496", size = 1) +
+  geom_vline(xintercept = fixef(M1.b)[1, 3:4], color = "#839496", linetype = 2) +
+  geom_halfeyeh(.width = .5, size = 2/3, fill = "#859900") +
+  labs(x = expression("Entidad (efecto aleatorio)"),
+       y = "Entidades federativas") +
+  theme(panel.grid   = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y  = element_text(hjust = 0),
+        text = element_text(family = "Ubuntu")) 
+```
+
+# Evaluación de modelos con cross-validation y loo
+
+*The Pareto k estimate is a diagnostic for Pareto smoothed importance sampling (PSIS), which is used to compute components of elpd_loo. In importance-sampling LOO (the full posterior distribution is used as the proposal distribution). The Pareto k diagnostic estimates how far an individual leave-one-out distribution is from the full distribution. If leaving out an observation changes the posterior too much then importance sampling is not able to give reliable estimate. If k<0.5, then the corresponding component of elpd_loo is estimated with high accuracy. If 0.5<k<0.7 the accuracy is lower, but still ok. If k>0.7, then importance sampling is not able to provide useful estimate for that component/observation. Pareto k is also useful as a measure of influence of an observation. Highly influential observations have high k values. **Very high k values often indicate model misspecification, outliers or mistakes in data processing.*** 
+
+```{r}
+M1.b.loo<-loo(M1.b)
+M1.b.loo
+```
+
+*When using loo_compare(), the returned matrix will have one row per model and several columns of estimates. The values in the elpd_diff and se_diff columns of the returned matrix are computed by making pairwise comparisons between each model and the model with the largest ELPD (the model in the first row). For this reason the elpd_diff column will always have the value 0 in the first row (i.e., the difference between the preferred model and itself) and negative values in subsequent rows for the remaining models.*
+
+El modelo con el valor más bajo "elpd_diff" es el peor
+
+El modelo de referencia "0" es el mejor. La diferencia es trivial entre ambos. 
+
+```{r}
+loo_compare(M1.loo,M1.b.loo,M.loo)
+```
+
+## Pendientes aleatorias (al interior de cada estado)
+
+```{r}
+M1.c<-brm(pobreza ~ 1 + factor(niv_edexpjh) + tamhogesc + factor(tam_loc) + (1 + niv_edexpjh | ent), 
+        prior = c(set_prior("normal(0,10)", class = "b"),
+                  set_prior("normal(0,5)", class = "sd")),
+        family="bernoulli", chains=2, cores=2, iter=2000,  threads = threading(14, grainsize = 100),backend = "cmdstanr", data=D)
+summary(M1.c)
+```
+
+```{r}
+M1.c$data %>%
+  bind_cols(as_tibble(fitted(M1.c))) %>%
+  ggplot() +
+  geom_line(aes(x = niv_edexpjh, y = Estimate, group = ent), size = .75, alpha = .30) +
+  geom_line(aes(x = niv_edexpjh, y = pobreza, group = ent), size = .75, alpha = .15, color = "dodgerblue2") +
+  labs(x = "Educacion",
+       y = "Pobreza",
+       subtitle = "Azul=Observado. Negra cada estado") +
+  theme_minimal(base_size = 16) +
+  theme(plot.title = element_text(hjust = .5))
+```
+
+
+```{r}
+M1.c.loo<-loo(M1.c)
+loo_compare(M1.b.loo, M1.c.loo)
+```
+
+# Predicción
+
+```{r}
+D$prM1<-predict(M, newdata=D ,ndraws=300)
+D$prM1.c<-predict(M1.c, newdata=D ,ndraws=300)
+
+D %>% group_by(ent) %>% summarise(SPent=mean(pobreza, na.rm=T), M1Pent=mean(prM1[,1], na.rm=T), 
+                                  M1.cPent=mean(prM1.c[,1], na.rm=T)) -> Prent
+
+ggplot(Prent, aes(SPent*100, M1Pent*100)) + geom_point() + theme_classic() + labs(y="Estimado M1", x="Encuesta")
+
+ggplot(Prent, aes(SPent*100, M1.cPent*100)) + geom_point() + theme_classic() + labs(y="Estimado M1.c", x="Encuesta")
+
+```
+
+
+## Comparamos con regresiones por separado
+
+```{r}
+logit_model <- function(D) {
+  glm(pobreza ~ factor(niv_edexpjh) + tamhogesc + factor(tam_loc), data = D, family = binomial)
+}
+
+
+models <- by(D, D$ent, logit_model)
+
+
+predict_mean_prob <- function(model) {
+  probs <- predict(model, type = "response")
+  mean_prob <- mean(probs)
+  return(mean_prob)
+}
+
+
+mean_probs <- sapply(models, predict_mean_prob)
+
+
+observed_means <- tapply(D$pobreza, D$ent, mean)
+
+mean_values_df <- data.frame(ent = names(mean_probs), 
+                             predicted_mean = mean_probs, 
+                             observed_mean = observed_means)
+
+ggplot(mean_values_df, aes(x = ent)) +
+  geom_point(aes(y = predicted_mean, color = "Predicho"), size = 3) +
+  geom_point(aes(y = observed_mean, color = "Observado"), size = 3, shape = 3) +
+  labs(x = "ent", y = "Prop", title = "Pred vs Observado") +
+  scale_color_manual(values = c("blue", "red"), labels = c("Predicho", "Observado")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Segundo ejemplo: Ordinal v multinomial
+
+Cambiamos a `cumulative("logit")`
+
+```{r}
+D$i_privacion1<-D$i_privacion+1
+
+M2<-brm(i_privacion1 ~ 1 + factor(niv_edexpjh) + tamhogesc + factor(tam_loc) + (1 | ent), 
+        prior = c(set_prior("normal(0,10)", class = "b"),
+                  set_prior("normal(0,5)", class = "sd")),
+        family=cumulative("logit", threshold="flexible"), chains=4, cores=4, iter=2000,  threads = threading(14, grainsize = 100),backend = "cmdstanr", data=D)
+summary(M2)
+```
+
+En este caso `pp_check` lo hacemos con barras puesto que se trata de una variable de grupos
+
+```{r}
+pp_check(M2, nreps = 10, type = "bars")
+```
+
+También podemos hacerlo por algún tipo de variable
+
+```{r}
+pp_check(M2, type = "bars_grouped", group = "niv_edexpjh",
+         nreps = 10)
+```
+
+# Multinomial
+
+- Este modelo es sumamente pesado: predictores X categorías con efectos aleatorios X categorías.
+
+- Este modelo necesita prior débiles para producir resultados razonables. 
+
+- Intenten estimar este modelo con ML.
+
+```{r eval=TRUE}
+D$i_privacion1<-as.factor(D$i_privacion1)
+#Ds<-sample_n(D,10000)
+
+M3<-brm(i_privacion1 ~ 1  + factor(niv_edexpjh) + tamhogesc + factor(tam_loc) + (1 | ent), 
+         prior = c(set_prior("normal(0,5)", class="b", dpar = "mu2"), 
+ 						    set_prior("normal(0,5)", class="b", dpar = "mu3"), 
+ 							    set_prior("normal(0,5)", class="sd", dpar = "mu3"),
+ 							    set_prior("normal(0,5)", class="sd", dpar = "mu2"),
+ 						    set_prior("normal(0,5)", class="b", dpar = "mu4"),
+ 						    set_prior("normal(0,5)", class="b", dpar = "mu5"),
+ 						    set_prior("normal(0,5)", class="b", dpar = "mu6"),
+ 						    set_prior("normal(0,5)", class="b", dpar = "mu7")),
+        family = categorical(link = "logit"), chains=2, cores=2, iter=1500,  threads = threading(14, grainsize = 100),backend = "cmdstanr", data=D)
+```
+
+Claramente necesita más tiempo. 
+
+```{r}
+pp_check(M3, nreps = 10, type = "bars")
+```
+
+¿Qué modelo es mejor el ordinal o el multinomial?
+
+```{r}
+M2.loo<-loo(M2)
+M3.loo<-loo(M3)
+M2.loo
+M3.loo
+```
+
+
+```{r echo=FALSE}
+knitr::knit_exit()
+```
+
+
+
+
+
+
